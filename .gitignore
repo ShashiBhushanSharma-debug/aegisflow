@@ -1,0 +1,93 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+coverage.xml
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Secrets, credentials, and certificates
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.secret
+*.token
+secrets/
+secrets.*
+credentials/
+credentials.*
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+logs/
+log/
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# Build artifacts and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytype/
+site/
+
+# Local databases and state
+*.sqlite3
+*.db
+*.db-journal
+
+# Local config / deployment overrides
+*.local
+local_settings.py
+settings.local.py
+
+# Docker / compose local state (if any)
+.docker/
+
+# OS generated files
+.AppleDouble
+.LSOverride
+
+# Python tooling
+pip-wheel-metadata/
+
+# Node / frontend caches (if used later)
+node_modules/
+.npm/
+
+# If you keep generated docs or API spec artifacts locally
+openapi.json
+swagger.json
