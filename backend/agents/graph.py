@@ -7,9 +7,9 @@ from backend.agents.state import AgentState
 
 # --- Initialize Tiered Models ---
 # Fast 8B model for structured data extraction
-triage_llm = ChatGroq(model_name="llama3-8b-8192", temperature=0)
+triage_llm = ChatGroq(model_name="openai/gpt-oss-20b", temperature=0)
 # Powerful 70B model for nuanced legal/defense writing
-synthesis_llm = ChatGroq(model_name="llama3-70b-8192", temperature=0.2)
+synthesis_llm = ChatGroq(model_name="openai/gpt-oss-120b", temperature=0.2)
 
 # --- Pydantic Schema for Structured Output ---
 class TriageDecision(BaseModel):
