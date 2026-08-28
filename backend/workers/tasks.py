@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import time
 import httpx
 from backend.core.celery_app import celery_app
@@ -9,10 +10,22 @@ from backend.core.database import supabase
 from backend.workers.logistics import fetch_shipping_evidence
 from backend.workers.crm import fetch_customer_interactions
 from backend.agents.graph import dispute_graph
+from backend.workers.evidence_doc import build_explanation_letter
+from backend.workers.razorpay_client import upload_document, contest_dispute
 
-@celery_app.task(bind=True, name="tasks.process_dispute")
+log = logging.getLogger(__name__)
+
+# Evidence map field
+EVIDENCE_FIELD_MAP = {
+    "delivery_confirmation": "shipping_proof",
+    "support_tickets": "customer_communication",
+    "invoice": "billing_proof",
+    "refund_policy": "refund_cancellation_policy",
+    "access_log": "access_activity_log",
+}
+
+@celery_app.task(name="tasks.process_dispute", bind=True)
 def process_dispute_task(self, case_id: str):
-    print(f"[Celery Worker] Starting pipeline for case: {case_id}")
 
     async def run_pipeline():
         start_time = time.time()
@@ -117,28 +130,64 @@ def process_dispute_task(self, case_id: str):
         supabase.table("cases").update({"status": "HUMAN_REVIEW"}).eq("case_id", case_id).execute()
         print(f"[Celery Worker] Pipeline completed for {case_id}. Ready for HUMAN_REVIEW.")
 
-    asyncio.run(run_pipeline())
+    try:
+        asyncio.run(run_pipeline())
+    except Exception as e:
+        log.exception("Pipeline failed for %s", case_id)
+        supabase.table("cases").update({
+            "status": "FAILED",
+            "error": f"{type(e).__name__}: {e}"[:2000],
+        }).eq("case_id", case_id).execute()
+        raise
 
 # Task = Submit Dispute
 # backend/workers/tasks.py
+# Task = Submit Dispute
 @celery_app.task(name="tasks.submit_dispute", bind=True, max_retries=3)
-def submit_dispute_task(self, case_id: str):
-    case = supabase.table("cases").select("*").eq("case_id", case_id).execute().data[0]
-    claim = supabase.table("claims").select("*").eq("case_id", case_id).execute().data[0]
-    try:
-        r = httpx.patch(
-            f"https://api.razorpay.com/v1/disputes/{case['dispute_id']}/contest",
-            auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
-            json={"summary": claim["narrative"], "action": "submit"},
-            timeout=30,
-        )
-        r.raise_for_status()
+def submit_dispute_task(self, case_id: str, action: str = "draft"):
+    case_rows = supabase.table("cases").select("*").eq("case_id", case_id).execute().data
+    claim_rows = supabase.table("claims").select("*").eq("case_id", case_id).execute().data
+    ev_rows = supabase.table("evidence").select("*").eq("case_id", case_id).execute().data
+    if not case_rows or not claim_rows:
+        log.error("submit_dispute: missing case/claim for %s", case_id)
+        return
+    case, claim = case_rows[0], claim_rows[0]
+
+    if not getattr(settings, "RAZORPAY_KEY_ID", ""):
         supabase.table("cases").update({
-            "status": "SUBMITTED", "razorpay_response": r.json(),
+            "status": "SUBMITTED",
+            "razorpay_response": {"mock": True, "note": "no credentials configured"},
         }).eq("case_id", case_id).execute()
-    except Exception as e:
+        return
+
+    try:
+        pdf = build_explanation_letter(case, claim, ev_rows)
+        doc_id = upload_document(pdf, f"{case_id}-response.pdf")
+
+        evidence = {
+            "summary": claim["statement"][:1000],
+            "amount": int(float(case["amount"]) * 100),
+            "explanation_letter": [doc_id],
+        }
+        # attach any per-evidence documents you later generate
+        for e in ev_rows:
+            field = EVIDENCE_FIELD_MAP.get(e["type"])
+            if field and e.get("razorpay_doc_id"):
+                evidence.setdefault(field, []).append(e["razorpay_doc_id"])
+
+        resp = contest_dispute(case["dispute_id"], evidence, action=action)
+
         supabase.table("cases").update({
-            "status": "SUBMIT_FAILED", "error": str(e)[:2000],
+            "status": "SUBMITTED" if action == "submit" else "CASE_SYNTHESIZED",
+            "razorpay_response": resp,
+            "error": None,
+        }).eq("case_id", case_id).execute()
+        log.info("submit_dispute: %s %s", case_id, action)
+
+    except Exception as e:
+        body = getattr(getattr(e, "response", None), "text", "")
+        supabase.table("cases").update({
+            "status": "SUBMIT_FAILED",
+            "error": f"{type(e).__name__}: {e} {body}"[:2000],
         }).eq("case_id", case_id).execute()
         raise self.retry(exc=e, countdown=60)
-    

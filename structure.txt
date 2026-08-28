@@ -1,0 +1,67 @@
+.
+├── backend
+│   ├── agents
+│   │   ├── graph.py
+│   │   ├── nodes
+│   │   ├── prompts
+│   │   ├── __pycache__
+│   │   │   ├── graph.cpython-312.pyc
+│   │   │   └── state.cpython-312.pyc
+│   │   └── state.py
+│   ├── api
+│   │   ├── dependencies.py
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   └── __init__.cpython-312.pyc
+│   │   └── v1
+│   │       ├── endpoints
+│   │       │   ├── cases.py
+│   │       │   ├── __init__.py
+│   │       │   ├── __pycache__
+│   │       │   │   ├── cases.cpython-312.pyc
+│   │       │   │   ├── __init__.cpython-312.pyc
+│   │       │   │   └── webhooks.cpython-312.pyc
+│   │       │   └── webhooks.py
+│   │       ├── __init__.py
+│   │       ├── __pycache__
+│   │       │   ├── __init__.cpython-312.pyc
+│   │       │   └── router.cpython-312.pyc
+│   │       └── router.py
+│   ├── config.py
+│   ├── core
+│   │   ├── celery_app.py
+│   │   ├── database.py
+│   │   └── __pycache__
+│   │       ├── celery_app.cpython-312.pyc
+│   │       └── database.cpython-312.pyc
+│   ├── domain
+│   │   ├── enums.py
+│   │   └── schemas
+│   ├── guardrails
+│   │   ├── policy_gate.py
+│   │   └── validator.py
+│   ├── __init__.py
+│   ├── integrations
+│   ├── main.py
+│   ├── __pycache__
+│   │   ├── config.cpython-312.pyc
+│   │   ├── __init__.cpython-312.pyc
+│   │   └── main.cpython-312.pyc
+│   └── workers
+│       ├── crm.py
+│       ├── logistics.py
+│       ├── __pycache__
+│       │   ├── crm.cpython-312.pyc
+│       │   ├── logistics.cpython-312.pyc
+│       │   └── tasks.cpython-312.pyc
+│       └── tasks.py
+├── docker-compose.yml
+├── Dockerfile
+├── LICENSE
+├── README.md
+├── requirements.txt
+├── scripts
+│   └── seed_demo_cases.py
+└── structure.txt
+
+22 directories, 43 files

@@ -28,6 +28,8 @@ services:
       redis:
         condition: service_healthy
     restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   worker:
     build: .
@@ -43,3 +45,5 @@ services:
       redis:
         condition: service_healthy
     restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
