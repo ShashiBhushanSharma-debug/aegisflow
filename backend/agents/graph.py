@@ -1,25 +1,35 @@
 import os
 import re
-from pydantic import BaseModel, Field
+import json
+import logging
+from typing import Literal, Optional, Any
+from pydantic import BaseModel, Field, ValidationError
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 from backend.agents.state import AgentState
 from backend.config import settings
 
-# --- Initialize Tiered Models (read from settings, not hardcoded) ---
+log = logging.getLogger(__name__)
+
 TRIAGE_MODEL = os.getenv("GROQ_TRIAGE_MODEL", "openai/gpt-oss-20b")
 SYNTHESIS_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 triage_llm = ChatGroq(model_name=TRIAGE_MODEL, temperature=0)
+triage_llm_json = ChatGroq(
+    model_name=TRIAGE_MODEL, temperature=0,
+    model_kwargs={"response_format": {"type": "json_object"}},
+)
 synthesis_llm = ChatGroq(model_name=SYNTHESIS_MODEL, temperature=0.2)
 
 PLACEHOLDER_RE = re.compile(r'\[[A-Za-z][A-Za-z0-9 /\-\']{2,}\]')
 BANNED_PHRASES = ("your law firm", "insert ", "tbd", "lorem ipsum", "xxx")
 
+CATEGORIES = ("FRAUD", "NOT_DELIVERED", "PRODUCT_UNACCEPTABLE",
+              "DUPLICATE", "CREDIT_NOT_PROCESSED", "SUBSCRIPTION_CANCELED", "OTHER")
+
 
 def clean_narrative(text: str) -> str:
-    """Strip markdown and normalize whitespace — Razorpay's summary field is plain text."""
     text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
     text = re.sub(r'^#{1,6}\s*', '', text, flags=re.M)
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.M)
@@ -28,47 +38,152 @@ def clean_narrative(text: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', text).strip()
 
 
+# ── Triage ────────────────────────────────────────────────────────────
 class TriageDecision(BaseModel):
-    category: str = Field(description="Dispute reason, e.g., 'FRAUD' or 'NOT_DELIVERED'")
-    risk_level: str = Field(description="'LOW', 'MEDIUM', or 'HIGH'")
-    recommended_action: str = Field(description="'FIGHT', 'ACCEPT', or 'REVIEW'")
+    category: Literal[CATEGORIES]                                    # type: ignore[valid-type]
+    risk_level: Literal["LOW", "MEDIUM", "HIGH"]
+    recommended_action: Literal["FIGHT", "ACCEPT", "REVIEW"]
+    reasoning: str = Field(default="", description="<=2 sentences citing the evidence")
+
+
+TRIAGE_SYSTEM = """You classify payment disputes for a merchant. You are an impartial
+analyst, not the merchant's advocate. Many disputes are legitimate and must be conceded.
+
+Decide recommended_action from the EVIDENCE ONLY:
+- FIGHT: evidence positively contradicts the dispute reason — status DELIVERED with a
+  proof-of-delivery URL for a non-delivery claim, customer communication admitting receipt,
+  or a matching signature/OTP record.
+- ACCEPT: evidence supports the customer, or there is no evidence rebutting them. This
+  includes status LOST, UNDELIVERED, RTO, RTO_DELIVERED, CANCELLED, a refund already
+  issued, or DELIVERED with no proof of delivery and a high fraud score.
+- REVIEW: evidence is genuinely ambiguous or contradicts itself.
+
+Never choose FIGHT merely because the merchant would prefer it. If the tracking status
+shows the goods did not reach the customer, the correct answer is ACCEPT.
+risk_level describes the DISPUTE's threat to the merchant, not the chance of winning.
+
+Respond with ONE JSON object and nothing else — no prose, no markdown fences:
+{{"category": one of ["FRAUD","NOT_DELIVERED","PRODUCT_UNACCEPTABLE","DUPLICATE","CREDIT_NOT_PROCESSED","SUBSCRIPTION_CANCELED","OTHER"],
+  "risk_level": "LOW"|"MEDIUM"|"HIGH",
+  "recommended_action": "FIGHT"|"ACCEPT"|"REVIEW",
+  "reasoning": "one or two sentences naming the specific evidence field you relied on"}}"""
+
+triage_prompt = ChatPromptTemplate.from_messages([
+    ("system", TRIAGE_SYSTEM),
+    ("human", "Dispute:\n{payload}\n\nEvidence:\n{evidence}"),
+])
+
+
+def _strip_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        parts = s.split("```")
+        if len(parts) > 1:
+            s = parts[1]
+            if s.lower().startswith("json"):
+                s = s[4:]
+    return s.strip()
+
+
+def _coerce(data: Any) -> Any:
+    """Salvage the shapes gpt-oss actually emits."""
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, dict):
+        if isinstance(data.get("arguments"), dict):      # tool-call wrapper
+            data = data["arguments"]
+        elif isinstance(data.get("parameters"), dict):
+            data = data["parameters"]
+        data = {k: (v.upper() if isinstance(v, str) and k != "reasoning" else v)
+                for k, v in data.items()}
+    return data
+
+
+def parse_triage(raw: str) -> Optional[TriageDecision]:
+    txt = _strip_fences(raw)
+    try:
+        data = json.loads(txt)
+    except json.JSONDecodeError:
+        m = re.search(r'\{.*\}', txt, re.S)               # dig the object out of prose
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group())
+        except json.JSONDecodeError:
+            return None
+    try:
+        return TriageDecision(**_coerce(data))
+    except (ValidationError, TypeError):
+        return None
+
+
+def _call_triage(vars_: dict) -> str:
+    """JSON mode first; fall back to plain completion if the model rejects it."""
+    try:
+        return (triage_prompt | triage_llm_json).invoke(vars_).content
+    except Exception as e:
+        log.warning("triage json-mode call failed, retrying plain: %s", e)
+        return (triage_prompt | triage_llm).invoke(vars_).content
 
 
 def triage_node(state: AgentState) -> AgentState:
     print(f"[Agent Node] Running Groq Triage for Case: {state['case_id']}")
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are an expert FinTech dispute resolution AI. Analyze the dispute data and output strict JSON."),
-        ("human", "Dispute Payload: {payload}")
-    ])
-    structured_llm = triage_llm.with_structured_output(TriageDecision)
-    chain = prompt | structured_llm
+    vars_ = {
+        "payload": json.dumps(state["dispute_payload"], default=str, indent=2),
+        "evidence": json.dumps(state.get("evidence_data") or [], default=str, indent=2),
+    }
 
-    response = chain.invoke({"payload": state["dispute_payload"]})
-    state["triage_analysis"] = response.model_dump()
-    state["execution_logs"].append(f"Triage completed via {TRIAGE_MODEL}.")
+    decision, raw = None, ""
+    for attempt in range(3):
+        try:
+            raw = _call_triage(vars_)
+        except Exception as e:
+            log.warning("triage call failed (attempt %d): %s", attempt + 1, e)
+            continue
+        decision = parse_triage(raw)
+        if decision:
+            break
+        log.warning("triage parse failed (attempt %d): %r", attempt + 1, raw[:400])
+
+    if decision is None:
+        state["triage_analysis"] = {
+            "category": "OTHER", "risk_level": "HIGH", "recommended_action": "REVIEW",
+            "reasoning": "Automated triage unavailable; routed to human review.",
+        }
+        state["triage_degraded"] = True
+        state["execution_logs"].append(f"Triage DEGRADED ({TRIAGE_MODEL}) -> REVIEW.")
+        return state
+
+    state["triage_analysis"] = decision.model_dump()
+    state["triage_raw"] = raw[:2000]          # keep for auditing the model's actual output
+    state["triage_degraded"] = False
+    state["execution_logs"].append(
+        f"Triage via {TRIAGE_MODEL}: {decision.recommended_action} "
+        f"/ {decision.category} / risk={decision.risk_level} — {decision.reasoning}"
+    )
     return state
 
 
+# ── Recovery intel ────────────────────────────────────────────────────
 def recovery_intel_node(state: AgentState) -> AgentState:
-    """Recovery Intel Engine: deterministic win-probability from evidence strength."""
     print(f"[Agent Node] Calculating Recovery Metrics for Case: {state['case_id']}")
 
     triage = state.get("triage_analysis") or {}
     action = triage.get("recommended_action", "REVIEW")
     risk = triage.get("risk_level", "HIGH")
 
-    # Base rate from what triage recommends doing, not from dispute risk
     base = {"FIGHT": 0.75, "REVIEW": 0.45, "ACCEPT": 0.10}.get(action, 0.40)
 
-    # Evidence strength adjustments
     ev = [e for e in (state.get("evidence_data") or []) if isinstance(e, dict)]
-    delivered = any(str(e.get("status", "")).upper() == "DELIVERED" for e in ev)
+    status = next((str(e.get("status", "")).upper() for e in ev if e.get("status")), "")
+    delivered = status == "DELIVERED"
+    failed_delivery = status in ("RTO_DELIVERED", "RTO", "LOST", "UNDELIVERED", "CANCELLED")
     has_pod = any(e.get("pod_url") for e in ev)
-    low_fraud = any(
-        isinstance(e.get("fraud_risk_score"), (int, float)) and e["fraud_risk_score"] < 0.3
-        for e in ev
-    )
+    fraud = next((e["fraud_risk_score"] for e in ev
+                  if isinstance(e.get("fraud_risk_score"), (int, float))), None)
+    low_fraud = fraud is not None and fraud < 0.3
+    high_fraud = fraud is not None and fraud > 0.5
 
     if delivered:
         base += 0.10
@@ -76,6 +191,12 @@ def recovery_intel_node(state: AgentState) -> AgentState:
         base += 0.10
     if low_fraud:
         base += 0.05
+    if failed_delivery:
+        base -= 0.45
+    if delivered and not has_pod:
+        base -= 0.15
+    if high_fraud:
+        base -= 0.15
     if risk == "HIGH" and not (delivered or has_pod):
         base -= 0.15
 
@@ -87,16 +208,37 @@ def recovery_intel_node(state: AgentState) -> AgentState:
         "disputed_amount": amount,
         "expected_recovery_value": round(amount * probability, 2),
         "signals": {
-            "action": action, "risk": risk,
-            "delivered": delivered, "pod": has_pod, "low_fraud": low_fraud,
+            "action": action, "risk": risk, "status": status or None,
+            "delivered": delivered, "failed_delivery": failed_delivery,
+            "pod": has_pod, "fraud_score": fraud, "low_fraud": low_fraud,
         },
     }
     state["execution_logs"].append(
-        f"Recovery: p={probability} (action={action}, delivered={delivered}, pod={has_pod})"
+        f"Recovery: p={probability} (action={action}, status={status or 'n/a'}, "
+        f"delivered={delivered}, pod={has_pod}, fraud={fraud})"
     )
     return state
 
 
+# ── Concession (the lose path) ────────────────────────────────────────
+def concession_node(state: AgentState) -> AgentState:
+    print(f"[Agent Node] Conceding Case: {state['case_id']}")
+    t = state.get("triage_analysis") or {}
+    state["drafted_narrative"] = None
+    state["final_action"] = "ACCEPT_DISPUTE"
+    state["guardrail_passed"] = True
+    state["execution_logs"].append(
+        f"Conceded without contest — {t.get('reasoning') or 'evidence supports the customer'}."
+    )
+    return state
+
+
+def route_after_recovery(state: AgentState) -> str:
+    action = (state.get("triage_analysis") or {}).get("recommended_action", "REVIEW")
+    return "concession" if action == "ACCEPT" else "synthesis"
+
+
+# ── Synthesis ─────────────────────────────────────────────────────────
 SYNTHESIS_SYSTEM = """You draft the merchant's evidence summary for a payment dispute.
 This text is submitted to Razorpay as plain text in a structured API field.
 
@@ -117,19 +259,20 @@ def synthesis_node(state: AgentState) -> AgentState:
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYNTHESIS_SYSTEM),
-        ("human", "Case Info: {payload}\n\nEvidence: {evidence}")
+        ("human", "Case Info: {payload}\n\nEvidence: {evidence}"),
     ])
-    chain = prompt | synthesis_llm
-    response = chain.invoke({
-        "payload": state["dispute_payload"],
-        "evidence": state["evidence_data"],
+    response = (prompt | synthesis_llm).invoke({
+        "payload": json.dumps(state["dispute_payload"], default=str, indent=2),
+        "evidence": json.dumps(state.get("evidence_data") or [], default=str, indent=2),
     })
 
     state["drafted_narrative"] = clean_narrative(response.content)
+    state["final_action"] = "CONTEST"
     state["execution_logs"].append(f"Defense narrative synthesized via {SYNTHESIS_MODEL}.")
     return state
 
 
+# ── Guardrails ────────────────────────────────────────────────────────
 def guardrail_node(state: AgentState) -> AgentState:
     print(f"[Agent Node] Running Guardrails for Case: {state['case_id']}")
 
@@ -149,10 +292,11 @@ def guardrail_node(state: AgentState) -> AgentState:
     if any(m in narrative for m in ("**", "##", "```")):
         failures.append("markdown survived sanitization")
 
-    # Grounding: the order id must actually appear if it was supplied
     order_id = str(state.get("order_id") or "")
-    if order_id and order_id not in narrative:
-        failures.append("narrative does not reference the order id")
+    if order_id:
+        norm = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
+        if norm(order_id) not in norm(narrative):
+            failures.append("narrative does not reference the order id")
 
     state["guardrail_passed"] = not failures
     state["execution_logs"].append(
@@ -166,12 +310,15 @@ def build_dispute_graph():
     workflow.add_node("triage", triage_node)
     workflow.add_node("recovery_intel", recovery_intel_node)
     workflow.add_node("synthesis", synthesis_node)
+    workflow.add_node("concession", concession_node)
     workflow.add_node("guardrails", guardrail_node)
 
     workflow.set_entry_point("triage")
     workflow.add_edge("triage", "recovery_intel")
-    workflow.add_edge("recovery_intel", "synthesis")
+    workflow.add_conditional_edges("recovery_intel", route_after_recovery,
+                                   {"synthesis": "synthesis", "concession": "concession"})
     workflow.add_edge("synthesis", "guardrails")
+    workflow.add_edge("concession", END)
     workflow.add_edge("guardrails", END)
     return workflow.compile()
 

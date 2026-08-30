@@ -1,6 +1,7 @@
 from typing import TypedDict, Optional, List, Dict, Any
 
-class AgentState(TypedDict):
+
+class AgentState(TypedDict, total=False):
     case_id: str
     order_id: str
     merchant_id: str
@@ -11,4 +12,7 @@ class AgentState(TypedDict):
     drafted_narrative: Optional[str]
     guardrail_passed: bool
     execution_logs: List[str]
-    
+    # added
+    triage_raw: Optional[str]
+    triage_degraded: bool
+    final_action: Optional[str]

@@ -58,3 +58,22 @@ async def contest(dispute_id: str, body: dict):
         d["evidence"]["submitted_at"] = int(time.time())
 
     return d
+
+@app.post("/v1/disputes/{dispute_id}/accept")
+async def accept(dispute_id: str):
+    d = DISPUTES.setdefault(dispute_id, {
+        "id": dispute_id, "entity": "dispute", "status": "open",
+        "phase": "chargeback", "respond_by": int(time.time()) + 7 * 86400,
+        "amount": 250000, "currency": "INR",
+        "evidence": {k: None for k in EVIDENCE_FIELDS} | {"amount": None, "summary": None, "submitted_at": None},
+    })
+    if d["status"] in ("won", "lost", "closed", "under_review"):
+        raise HTTPException(400, {"error": {"code": "BAD_REQUEST_ERROR",
+            "description": f"Action not allowed when dispute is in {d['status']} status"}})
+    if time.time() > d["respond_by"]:
+        raise HTTPException(400, {"error": {"code": "BAD_REQUEST_ERROR",
+            "description": "Action not allowed as deadline to respond has elapsed"}})
+    d["status"] = "lost"
+    d["amount_deducted"] = d.get("amount", 0)
+    d["resolved_at"] = int(time.time())
+    return d

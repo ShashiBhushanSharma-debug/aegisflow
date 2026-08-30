@@ -27,3 +27,12 @@ def contest_dispute(dispute_id: str, evidence: dict, action: str = "draft") -> d
     )
     r.raise_for_status()
     return r.json()
+
+def accept_dispute(dispute_id: str) -> dict:
+    r = httpx.post(
+        f"{BASE}/disputes/{dispute_id}/accept",
+        auth=_auth(),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
