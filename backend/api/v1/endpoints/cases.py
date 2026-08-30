@@ -57,13 +57,31 @@ async def get_case(case_id: str):
 async def approve_case(case_id: str, payload: ApprovalPayload):
     _guard(case_id)
 
-    supabase.table("claims").update({
+    rows = supabase.table("claims").select("*").eq("case_id", case_id).execute().data
+    if not rows:
+        raise HTTPException(404, "No claim for this case")
+    claim = rows[0]
+
+    # An operator approving does not overrule the guardrails. If the generated
+    # narrative was blocked, it must be edited before it can be approved.
+    edited = (payload.approved_narrative or "").strip() != (claim.get("statement") or "").strip()
+    if not claim.get("is_grounded") and not edited:
+        raise HTTPException(422, "Narrative failed guardrails and was not edited. "
+                                 "Edit the narrative or reprocess the case.")
+
+    updates = {
         "statement": payload.approved_narrative,
-        "is_grounded": True,
         "approved_by": payload.reviewer,
         "approved_at": _now(),
-    }).eq("case_id", case_id).execute()
+    }
+    if edited:
+        from backend.agents.graph import validate_narrative
+        failures = validate_narrative(payload.approved_narrative, case_id)
+        if failures:
+            raise HTTPException(422, f"Edited narrative failed guardrails: {'; '.join(failures)}")
+        updates["is_grounded"] = True
 
+    supabase.table("claims").update(updates).eq("case_id", case_id).execute()
     supabase.table("cases").update({
         "status": "APPROVED",
         "reviewer": payload.reviewer,

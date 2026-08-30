@@ -195,7 +195,10 @@ hr "5. FINAL SUBMIT"
 
 docker compose exec -T worker python -c "
 from backend.workers.tasks import submit_dispute_task
-submit_dispute_task('$CASE', action='submit')" >/dev/null
+try:
+    submit_dispute_task('$CASE', action='submit')
+except Exception as e:
+    print(f'  task raised      : {type(e).__name__}: {e}')" 2>&1 | grep -E "task raised" || true
 
 curl -s "$API/cases/$CASE" | python3 -c "
 import sys, json

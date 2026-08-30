@@ -293,34 +293,41 @@ def synthesis_node(state: AgentState) -> AgentState:
 
 
 # ── Guardrails ────────────────────────────────────────────────────────
-def guardrail_node(state: AgentState) -> AgentState:
-    print(f"[Agent Node] Running Guardrails for Case: {state['case_id']}")
-
-    narrative = state.get("drafted_narrative") or ""
+def validate_narrative(narrative: str, order_id: str = "") -> list[str]:
+    """Guardrail checks as a pure function; reused by the review endpoint."""
+    narrative = narrative or ""
     failures = []
 
     if len(narrative) < 200:
         failures.append("narrative too short")
     if len(narrative.split()) > 500:
         failures.append("narrative too long")
-    if PLACEHOLDER_RE.search(narrative):
-        failures.append(f"unfilled placeholder: {PLACEHOLDER_RE.search(narrative).group()}")
+    m = PLACEHOLDER_RE.search(narrative)
+    if m:
+        failures.append(f"unfilled placeholder: {m.group()}")
     low = narrative.lower()
     for phrase in BANNED_PHRASES:
         if phrase in low:
             failures.append(f"banned phrase: {phrase}")
-    if any(m in narrative for m in ("**", "##", "```")):
+    if any(x in narrative for x in ("**", "##", "```")):
         failures.append("markdown survived sanitization")
 
-    order_id = str(state.get("order_id") or "")
-    if order_id:
-        if order_id not in narrative:
-            norm = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
-            if norm(order_id) in norm(narrative):
-                failures.append(f"order id reformatted (expected exact '{order_id}')")
-            else:
-                failures.append("narrative does not reference the order id")
+    order_id = str(order_id or "")
+    if order_id and order_id not in narrative:
+        norm = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
+        if norm(order_id) in norm(narrative):
+            failures.append(f"order id reformatted (expected exact '{order_id}')")
+        else:
+            failures.append("narrative does not reference the order id")
 
+    return failures
+
+
+def guardrail_node(state: AgentState) -> AgentState:
+    print(f"[Agent Node] Running Guardrails for Case: {state['case_id']}")
+    narrative = state.get("drafted_narrative") or ""
+    order_id = state.get("order_id") or state["dispute_payload"].get("order_id", "") or ""
+    failures = validate_narrative(narrative, order_id)
     state["guardrail_passed"] = not failures
     state["execution_logs"].append(
         "Guardrails passed." if not failures else f"Guardrails failed: {'; '.join(failures)}"
