@@ -47,26 +47,40 @@ class TriageDecision(BaseModel):
 
 
 TRIAGE_SYSTEM = """You classify payment disputes for a merchant. You are an impartial
-analyst, not the merchant's advocate. Many disputes are legitimate and must be conceded.
+    analyst, not the merchant's advocate. Many disputes are legitimate and must be conceded.
 
-Decide recommended_action from the EVIDENCE ONLY:
-- FIGHT: evidence positively contradicts the dispute reason — status DELIVERED with a
-  proof-of-delivery URL for a non-delivery claim, customer communication admitting receipt,
-  or a matching signature/OTP record.
-- ACCEPT: evidence supports the customer, or there is no evidence rebutting them. This
-  includes status LOST, UNDELIVERED, RTO, RTO_DELIVERED, CANCELLED, a refund already
-  issued, or DELIVERED with no proof of delivery and a high fraud score.
-- REVIEW: evidence is genuinely ambiguous or contradicts itself.
+    Decide recommended_action from the EVIDENCE ONLY:
+    - FIGHT: evidence positively contradicts the dispute reason — status DELIVERED with a
+    proof-of-delivery URL for a non-delivery claim, customer communication admitting receipt,
+    or a matching signature/OTP record.
+    - ACCEPT: evidence supports the customer, or there is no evidence rebutting them. This
+    includes status LOST, UNDELIVERED, RTO, RTO_DELIVERED, CANCELLED, a refund already
+    issued, or DELIVERED with no proof of delivery and a high fraud score.
+    - REVIEW: evidence is genuinely ambiguous or contradicts itself.
 
-Never choose FIGHT merely because the merchant would prefer it. If the tracking status
-shows the goods did not reach the customer, the correct answer is ACCEPT.
-risk_level describes the DISPUTE's threat to the merchant, not the chance of winning.
+    Never choose FIGHT merely because the merchant would prefer it. If the tracking status
+    shows the goods did not reach the customer, the correct answer is ACCEPT.
 
-Respond with ONE JSON object and nothing else — no prose, no markdown fences:
-{{"category": one of ["FRAUD","NOT_DELIVERED","PRODUCT_UNACCEPTABLE","DUPLICATE","CREDIT_NOT_PROCESSED","SUBSCRIPTION_CANCELED","OTHER"],
-  "risk_level": "LOW"|"MEDIUM"|"HIGH",
-  "recommended_action": "FIGHT"|"ACCEPT"|"REVIEW",
-  "reasoning": "one or two sentences naming the specific evidence field you relied on"}}"""
+    risk_level describes the DISPUTE's threat to the merchant, not the chance of winning.
+    Assign it deterministically from the evidence, applying the first rule that matches:
+    - LOW: delivery confirmed (status DELIVERED) with a proof-of-delivery URL present,
+    and fraud score below 0.3.
+    - HIGH: delivery failed or unproven (status LOST, UNDELIVERED, RTO, RTO_DELIVERED,
+    CANCELLED, or DELIVERED with no proof-of-delivery URL), or fraud score above 0.5,
+    or no evidence at all.
+    - MEDIUM: everything else — partial evidence, or fraud score between 0.3 and 0.5.
+    Identical evidence must always produce the same risk_level.
+
+    category is the nature of the dispute as the evidence shows it. It will often match
+    reason_code, and that is correct — choose it when it fits. Use OTHER only when no listed
+    category applies. Deviate from reason_code only when the evidence clearly shows a different
+    kind of dispute than the one claimed.
+
+    Respond with ONE JSON object and nothing else — no prose, no markdown fences:
+    {{"category": one of ["FRAUD","NOT_DELIVERED","PRODUCT_UNACCEPTABLE","DUPLICATE","CREDIT_NOT_PROCESSED","SUBSCRIPTION_CANCELED","OTHER"],
+    "risk_level": "LOW"|"MEDIUM"|"HIGH",
+    "recommended_action": "FIGHT"|"ACCEPT"|"REVIEW",
+    "reasoning": "one or two sentences naming the specific evidence field you relied on"}}"""
 
 triage_prompt = ChatPromptTemplate.from_messages([
     ("system", TRIAGE_SYSTEM),
@@ -184,6 +198,7 @@ def recovery_intel_node(state: AgentState) -> AgentState:
                   if isinstance(e.get("fraud_risk_score"), (int, float))), None)
     low_fraud = fraud is not None and fraud < 0.3
     high_fraud = fraud is not None and fraud > 0.5
+    no_evidence = not ev
 
     if delivered:
         base += 0.10
@@ -197,7 +212,9 @@ def recovery_intel_node(state: AgentState) -> AgentState:
         base -= 0.15
     if high_fraud:
         base -= 0.15
-    if risk == "HIGH" and not (delivered or has_pod):
+    # Evidence-only weak-position penalty; independent of the model's risk_level,
+    # which varies run to run on identical inputs.
+    if not (delivered or has_pod) and (high_fraud or failed_delivery or no_evidence):
         base -= 0.15
 
     probability = round(max(0.05, min(base, 0.95)), 2)
@@ -211,6 +228,7 @@ def recovery_intel_node(state: AgentState) -> AgentState:
             "action": action, "risk": risk, "status": status or None,
             "delivered": delivered, "failed_delivery": failed_delivery,
             "pod": has_pod, "fraud_score": fraud, "low_fraud": low_fraud,
+            "no_evidence": no_evidence,
         },
     }
     state["execution_logs"].append(
@@ -250,8 +268,10 @@ Rules you must follow absolutely:
   If a fact is not in the evidence, omit it entirely.
 - State only facts present in the evidence provided. Do not invent tracking
   numbers, dates, names, amounts, or customer communications.
-- 150-300 words, third person, factual and neutral. Not adversarial.
-- Open with the core claim, then cite the specific evidence that supports it."""
+- 300-500 words, third person, factual and neutral. Not adversarial, important numbers and transactional data bolded.
+- Open with the core claim, then cite the specific evidence that supports it.
+- Refer to the order using its exact identifier as given in Case Info, character for
+  character, including any prefix and underscores. Never abbreviate or reformat it."""
 
 
 def synthesis_node(state: AgentState) -> AgentState:
@@ -294,9 +314,12 @@ def guardrail_node(state: AgentState) -> AgentState:
 
     order_id = str(state.get("order_id") or "")
     if order_id:
-        norm = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
-        if norm(order_id) not in norm(narrative):
-            failures.append("narrative does not reference the order id")
+        if order_id not in narrative:
+            norm = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
+            if norm(order_id) in norm(narrative):
+                failures.append(f"order id reformatted (expected exact '{order_id}')")
+            else:
+                failures.append("narrative does not reference the order id")
 
     state["guardrail_passed"] = not failures
     state["execution_logs"].append(

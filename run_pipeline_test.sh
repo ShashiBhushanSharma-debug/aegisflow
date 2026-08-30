@@ -25,6 +25,17 @@ esac
 
 hr() { printf '\n\033[1;36m── %s ─────────────────────────────\033[0m\n' "$1"; }
 
+if [ "${RESET:-0}" = "1" ]; then
+  docker compose exec -T worker python -c "
+from backend.core.database import supabase as s
+for t in ('claims','evidence','agent_runs','policy_decisions','webhook_events','cases'):
+    try:
+        s.table(t).delete().like('case_id','CASE-disp_TEST%').execute()
+    except Exception as e:
+        print(f'  reset {t}: {e}')
+print('  reset            : test cases purged')"
+fi
+
 # ─────────────────────────────────────────────────────────────
 hr "0. PRE-FLIGHT"
 
@@ -227,9 +238,10 @@ curl -s -X POST "$API/webhooks/razorpay/dispute" \
   -H "X-Razorpay-Signature: $SIGT" --data-raw "$TERM_BODY"; echo
 
 echo -n "  final status     : "
-curl -s "$API/cases/$CASE" | python3 -c \
-  "import sys,json; print(json.load(sys.stdin)['case']['status'])"
-
+FINAL=$(curl -s "$API/cases/$CASE" | python3 -c \
+  "import sys,json; print(json.load(sys.stdin)['case']['status'])")
+if [ "$OUTCOME" = "WIN" ]; then EXPECT=WON; else EXPECT=LOST; fi
+if [ "$FINAL" = "$EXPECT" ]; then echo "$FINAL"; else echo "$FINAL (expected $EXPECT)"; fi
 # ─────────────────────────────────────────────────────────────
 hr "DONE"
 echo "  scenario   : $OUTCOME"

@@ -17,8 +17,8 @@ log = logging.getLogger(__name__)
 
 # Events that close a case rather than start a pipeline
 TERMINAL_EVENTS = {
-    "payment.dispute.won": "ACCEPTED",
-    "payment.dispute.lost": "CLOSED",
+    "payment.dispute.won": "WON",
+    "payment.dispute.lost": "LOST",
     "payment.dispute.closed": "CLOSED",
 }
 
