@@ -31,8 +31,8 @@ async def contest(dispute_id: str, body: dict):
         "phase": "chargeback", "respond_by": int(time.time()) + 7 * 86400,
         "evidence": {k: None for k in EVIDENCE_FIELDS} | {"amount": None, "summary": None, "submitted_at": None},
     })
-
-    if d["status"] in ("won", "lost", "closed"):
+    
+    if d["status"] in ("won", "lost", "closed", "under_review"):
         raise HTTPException(400, {"error": {"code": "BAD_REQUEST_ERROR",
             "description": f"Action not allowed when dispute is in {d['status']} status"}})
     if time.time() > d["respond_by"]:

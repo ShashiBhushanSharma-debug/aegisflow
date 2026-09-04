@@ -194,6 +194,14 @@ def submit_dispute_task(self, case_id: str, action: str = "draft"):
     case, claim = case_rows[0], claim_rows[0]
     recommended = pol_rows[0]["action"] if pol_rows else "REVIEW"
 
+    # Never overwrite a resolved or already-filed case. The endpoint returns 409 for
+    # these, but the task is also reachable from Celery retries and direct calls.
+    TERMINAL = ("WON", "LOST", "CLOSED", "CONCEDED", "SUBMITTED")
+    if case["status"] in TERMINAL:
+        log.warning("submit_dispute: %s is %s, refusing to resubmit",
+                    case_id, case["status"])
+        return
+
     if not getattr(settings, "RAZORPAY_KEY_ID", ""):
         log.warning("submit_dispute: no Razorpay credentials, mocking %s", case_id)
         supabase.table("cases").update({

@@ -187,8 +187,6 @@ def recovery_intel_node(state: AgentState) -> AgentState:
     action = triage.get("recommended_action", "REVIEW")
     risk = triage.get("risk_level", "HIGH")
 
-    base = {"FIGHT": 0.75, "REVIEW": 0.45, "ACCEPT": 0.10}.get(action, 0.40)
-
     ev = [e for e in (state.get("evidence_data") or []) if isinstance(e, dict)]
     status = next((str(e.get("status", "")).upper() for e in ev if e.get("status")), "")
     delivered = status == "DELIVERED"
@@ -199,6 +197,30 @@ def recovery_intel_node(state: AgentState) -> AgentState:
     low_fraud = fraud is not None and fraud < 0.3
     high_fraud = fraud is not None and fraud > 0.5
     no_evidence = not ev
+
+    # ---- Deterministic cross-check on the model's recommendation ----------------
+    # Triage occasionally returns ACCEPT on a demonstrably winnable case (observed
+    # ~1 in 8 runs at temperature=0). Conceding is irreversible and costs the full
+    # disputed amount, so a recommendation that contradicts the hard delivery
+    # signals is escalated to a human rather than acted on. Never auto-upgrade to
+    # FIGHT — the model may be seeing something the signals do not capture.
+    override_reason = None
+    if action == "ACCEPT" and delivered and has_pod and not high_fraud:
+        override_reason = (
+            "Model recommended ACCEPT but delivery is confirmed (status DELIVERED) "
+            "with proof of delivery present and fraud score not elevated. "
+            "Escalated for human decision."
+        )
+        action = "REVIEW"
+        triage["recommended_action"] = "REVIEW"
+        triage["override_reason"] = override_reason
+        state["triage_analysis"] = triage
+        state["execution_logs"].append(
+            "OVERRIDE: ACCEPT contradicted by evidence (DELIVERED + POD, fraud "
+            f"{fraud}) -> REVIEW."
+        )
+
+    base = {"FIGHT": 0.75, "REVIEW": 0.45, "ACCEPT": 0.10}.get(action, 0.40)
 
     if delivered:
         base += 0.10
@@ -224,6 +246,8 @@ def recovery_intel_node(state: AgentState) -> AgentState:
         "win_probability": probability,
         "disputed_amount": amount,
         "expected_recovery_value": round(amount * probability, 2),
+        "overridden": override_reason is not None,
+        "override_reason": override_reason,
         "signals": {
             "action": action, "risk": risk, "status": status or None,
             "delivered": delivered, "failed_delivery": failed_delivery,

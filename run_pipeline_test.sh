@@ -2,6 +2,7 @@
 # AegisFlow — full end-to-end pipeline test
 # Usage:  ./run_pipeline_test.sh [reason_code] [amount_paise] [WIN|LOSE]
 # Example: ./run_pipeline_test.sh chargeback_fraud 250000 WIN
+#          RESET=1 ./run_pipeline_test.sh chargeback_fraud 250000 LOSE
 
 set -euo pipefail
 
@@ -125,8 +126,11 @@ print(f\"  exp_recovery  : {c['currency']} {float(pd.get('expected_recovery_valu
 print(f\"  latency       : {ar.get('latency_ms')} ms\")
 sig = (pd.get('rationale') or {}).get('signals')
 if sig: print(f\"  signals       : {json.dumps(sig)}\")
-rsig = ((ar.get('output_payload') or {}).get('recovery') or {}).get('signals')
+rec_out = (ar.get('output_payload') or {}).get('recovery') or {}
+rsig = rec_out.get('signals')
 if rsig: print(f\"  recovery sig  : {json.dumps(rsig)}\")
+if rec_out.get('overridden'):
+    print(f\"  OVERRIDE      : {rec_out.get('override_reason')}\")
 print()
 print('  ── EXECUTION LOG ──')
 for l in (ar.get('output_payload') or {}).get('logs', []): print(f'    • {l}')
@@ -193,12 +197,14 @@ print(f\"  error            : {c.get('error')}\")"
 # ─────────────────────────────────────────────────────────────
 hr "5. FINAL SUBMIT"
 
-docker compose exec -T worker python -c "
-from backend.workers.tasks import submit_dispute_task
-try:
-    submit_dispute_task('$CASE', action='submit')
-except Exception as e:
-    print(f'  task raised      : {type(e).__name__}: {e}')" 2>&1 | grep -E "task raised" || true
+echo -n "  submit           : "
+curl -s -X POST "$API/cases/$CASE/submit"; echo
+
+echo -n "  resubmit         : "
+curl -s -o /dev/null -w "HTTP %{http_code} (expect 409)\n" \
+  -X POST "$API/cases/$CASE/submit"
+
+sleep 5
 
 curl -s "$API/cases/$CASE" | python3 -c "
 import sys, json
@@ -212,7 +218,13 @@ print(f\"  error            : {c.get('error')}\")"
 # ─────────────────────────────────────────────────────────────
 hr "6. EVIDENCE PDF"
 
-docker compose exec -T worker python -c "
+REC=$(curl -s "$API/cases/$CASE" | python3 -c \
+  "import sys,json; p=json.load(sys.stdin).get('policy_decisions') or [{}]; print(p[0].get('action',''))")
+
+if [ "$REC" = "ACCEPT" ] || [ "$REC" = "AUTO_ACCEPT" ] || [ "$REC" = "ACCEPT_LOSS" ]; then
+  echo "  skipped          : case conceded, no defence letter required"
+else
+  docker compose exec -T worker python -c "
 from backend.core.database import supabase
 from backend.workers.evidence_doc import build_explanation_letter
 cid = '$CASE'
@@ -222,9 +234,9 @@ ev    = supabase.table('evidence').select('*').eq('case_id', cid).execute().data
 pdf = build_explanation_letter(case, claim, ev)
 open('/tmp/final_test.pdf','wb').write(pdf)
 print(f'  generated        : {len(pdf):,} bytes')"
-
-docker compose cp worker:/tmp/final_test.pdf ./final_test.pdf >/dev/null
-echo "  saved            : $(pwd)/final_test.pdf"
+  docker compose cp worker:/tmp/final_test.pdf ./final_test.pdf >/dev/null
+  echo "  saved            : $(pwd)/final_test.pdf"
+fi
 
 # ─────────────────────────────────────────────────────────────
 hr "7. TERMINAL EVENT"
@@ -245,16 +257,13 @@ FINAL=$(curl -s "$API/cases/$CASE" | python3 -c \
   "import sys,json; print(json.load(sys.stdin)['case']['status'])")
 if [ "$OUTCOME" = "WIN" ]; then EXPECT=WON; else EXPECT=LOST; fi
 if [ "$FINAL" = "$EXPECT" ]; then echo "$FINAL"; else echo "$FINAL (expected $EXPECT)"; fi
+
 # ─────────────────────────────────────────────────────────────
 hr "DONE"
 echo "  scenario   : $OUTCOME"
 echo "  dispute_id : $DID"
 echo "  case_id    : $CASE"
-echo "  pdf        : ./final_test.pdf"
 echo
 echo "  inspect : curl -s $API/cases/$CASE | python3 -m json.tool"
-echo "  reset   : docker compose exec worker python -c \\"
-echo "              \"from backend.core.database import supabase as s; \\"
-echo "               s.table('cases').delete().eq('case_id','$CASE').execute(); \\"
-echo "               s.table('webhook_events').delete().eq('case_id','$CASE').execute()\""
+echo "  reset   : RESET=1 ./run_pipeline_test.sh"
 echo
