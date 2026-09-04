@@ -31,6 +31,10 @@ async function request(path, options = {}) {
 
 export const listPending = () => request("/cases/pending");
 
+export const listHistory = () => request("/cases/history");
+
+export const getStats = () => request("/cases/stats");
+
 export const getCase = (caseId) => request(`/cases/${encodeURIComponent(caseId)}`);
 
 export const approveCase = (caseId, payload) =>

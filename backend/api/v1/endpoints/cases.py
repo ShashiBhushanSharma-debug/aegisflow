@@ -6,6 +6,12 @@ from backend.workers.tasks import submit_dispute_task
 
 router = APIRouter()
 
+HISTORY_STATUSES = [
+    "DRAFTED", "SUBMITTED", "CONCEDED", "WON", "LOST",
+    "CLOSED", "REJECTED", "BLOCKED", "SUBMIT_FAILED", "FAILED",
+]
+
+
 
 class ApprovalPayload(BaseModel):
     reviewer: str
@@ -40,6 +46,54 @@ async def get_pending_cases(limit: int = Query(50, le=200)):
          .order("created_at", desc=True)
          .limit(limit).execute())
     return {"pending_cases": r.data}
+
+@router.get("/history")
+async def case_history(limit: int = 50):
+    r = (supabase.table("cases")
+         .select("*, claims(*), policy_decisions(*)")
+         .in_("status", HISTORY_STATUSES)
+         .order("updated_at", desc=True)
+         .limit(limit).execute())
+    return {"cases": r.data}
+ 
+ 
+@router.get("/stats")
+async def case_stats():
+    rows = supabase.table("cases").select("case_id, status, amount").execute().data or []
+    pol = supabase.table("policy_decisions").select(
+        "case_id, win_probability, expected_recovery_value").execute().data or []
+
+    contested = {"SUBMITTED", "WON"}
+    conceded = {"CONCEDED", "LOST"}
+    resolved = {"WON", "LOST"}
+    # Cases that can still recover money. Rejected, conceded and closed cases
+    # are out of play, so their predicted value must not be counted.
+    in_play = {"HUMAN_REVIEW", "APPROVED", "DRAFTED", "SUBMITTED"}
+
+    def total(statuses):
+        return sum(float(x.get("amount") or 0) for x in rows if x["status"] in statuses)
+
+    live_ids = {x["case_id"] for x in rows if x["status"] in in_play}
+    won = total({"WON"})
+    lost_after_contest = total({"LOST"})
+    decided = [x for x in rows if x["status"] in resolved]
+
+    return {
+        "total_cases": len(rows),
+        "awaiting_review": sum(1 for x in rows if x["status"] == "HUMAN_REVIEW"),
+        "contested": sum(1 for x in rows if x["status"] in contested),
+        "conceded": sum(1 for x in rows if x["status"] in conceded),
+        "amount_contested": round(total(contested), 2),
+        "amount_conceded": round(total(conceded), 2),
+        # Realised outcome, not a prediction.
+        "amount_recovered": round(won, 2),
+        "amount_forfeited": round(lost_after_contest, 2),
+        "resolved_cases": len(decided),
+        # Forward-looking, live cases only.
+        "predicted_recovery": round(
+            sum(float(p.get("expected_recovery_value") or 0)
+                for p in pol if p.get("case_id") in live_ids), 2),
+    }
 
 
 @router.get("/{case_id}")
@@ -76,7 +130,10 @@ async def approve_case(case_id: str, payload: ApprovalPayload):
     }
     if edited:
         from backend.agents.graph import validate_narrative
-        failures = validate_narrative(payload.approved_narrative, case_id)
+        case_row = (supabase.table("cases").select("order_id")
+                    .eq("case_id", case_id).execute().data or [{}])[0]
+        failures = validate_narrative(payload.approved_narrative,
+                                        case_row.get("order_id", ""))
         if failures:
             raise HTTPException(422, f"Edited narrative failed guardrails: {'; '.join(failures)}")
         updates["is_grounded"] = True
@@ -106,3 +163,23 @@ async def reject_case(case_id: str, payload: RejectionPayload):
     }).eq("case_id", case_id).execute()
 
     return {"status": "REJECTED", "case_id": case_id}
+
+@router.post("/{case_id}/submit")
+async def submit_case(case_id: str):
+    rows = supabase.table("cases").select("*").eq("case_id", case_id).execute().data
+    if not rows:
+        raise HTTPException(404, "Case not found")
+    case = rows[0]
+
+    if case["status"] in ("SUBMITTED", "CONCEDED", "WON", "LOST", "CLOSED"):
+        raise HTTPException(409, f"Case already {case['status']}")
+    if case["status"] != "DRAFTED":
+        raise HTTPException(409, f"Case is {case['status']}, expected DRAFTED")
+
+    claim = (supabase.table("claims").select("is_grounded")
+             .eq("case_id", case_id).execute().data or [{}])[0]
+    if not claim.get("is_grounded"):
+        raise HTTPException(422, "Narrative failed guardrails; cannot submit")
+
+    submit_dispute_task.delay(case_id, action="submit")
+    return {"status": "SUBMITTING", "case_id": case_id}

@@ -11,12 +11,33 @@ const VERDICTS = {
   HUMAN_REVIEW: { label: "Needs decision", tone: "review" },
 };
 
+const STATUS_LABELS = {
+  HUMAN_REVIEW: "Awaiting review",
+  DRAFTED: "Staged",
+  SUBMITTED: "Filed",
+  CONCEDED: "Conceded",
+  WON: "Won",
+  LOST: "Lost",
+  CLOSED: "Closed",
+  REJECTED: "Rejected",
+  BLOCKED: "Blocked",
+  SUBMIT_FAILED: "Filing failed",
+  FAILED: "Pipeline failed",
+  EVIDENCE_REQUESTED: "Gathering evidence",
+  APPROVED: "Approved",
+  OPEN: "New",
+};
+
 export function verdict(action) {
   return VERDICTS[action] || { label: action || "Unknown", tone: "review" };
 }
 
 export function isConcession(action) {
   return verdict(action).tone === "accept";
+}
+
+export function statusLabel(status) {
+  return STATUS_LABELS[status] || (status || "").toLowerCase().replace(/_/g, " ");
 }
 
 export function money(amount, currency = "INR") {

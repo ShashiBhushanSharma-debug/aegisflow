@@ -171,6 +171,28 @@ def _mark_submit_failed(case_id: str, e: Exception):
         "error": f"{type(e).__name__}: {e} {body}"[:2000],
     }).eq("case_id", case_id).execute()
 
+def _evidence_document(row: dict) -> tuple[bytes, str]:
+    """Render one evidence record as an uploadable exhibit."""
+    payload = row.get("raw_payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {"raw": payload}
+
+    lines = [
+        f"EVIDENCE RECORD  {row.get('evidence_id')}",
+        f"Type             {row.get('type')}",
+        f"Source           {row.get('source')}",
+        f"Source record    {row.get('source_record_id')}",
+        f"Content hash     {row.get('content_hash')}",
+        f"Validation       {row.get('validation_status')}",
+        "",
+        "PAYLOAD",
+        json.dumps(payload, indent=2, default=str, ensure_ascii=False),
+    ]
+    return "\n".join(lines).encode(), f"{row.get('evidence_id')}.txt"
+
 
 def _is_retryable(e: Exception) -> bool:
     if isinstance(e, TRANSIENT):
@@ -256,10 +278,25 @@ def submit_dispute_task(self, case_id: str, action: str = "draft"):
             "amount": int(float(case["amount"]) * 100),
             "explanation_letter": [doc_id],
         }
+                # Upload each evidence record as an exhibit. The summary letter alone
+        # is weak defence — the attached delivery proof and support history are
+        # what a card network actually weighs.
         for e in ev_rows:
-            field = EVIDENCE_FIELD_MAP.get(e["type"])
-            if field and field != "explanation_letter" and e.get("razorpay_doc_id"):
-                evidence.setdefault(field, []).append(e["razorpay_doc_id"])
+            field = EVIDENCE_FIELD_MAP.get(e.get("type"))
+            if not field or field == "explanation_letter":
+                continue
+            doc = e.get("razorpay_doc_id")
+            if not doc:
+                try:
+                    blob, filename = _evidence_document(e)
+                    doc = upload_document(blob, filename)
+                    supabase.table("evidence").update(
+                        {"razorpay_doc_id": doc}
+                    ).eq("evidence_id", e["evidence_id"]).execute()
+                except Exception:
+                    log.exception("exhibit upload failed for %s", e.get("evidence_id"))
+                    continue
+            evidence.setdefault(field, []).append(doc)
 
         resp = contest_dispute(case["dispute_id"], evidence, action=action)
 
